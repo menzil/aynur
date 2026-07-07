@@ -1,7 +1,13 @@
 [package]
 name = "aynur"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
+authors = ["ruzaji yasin"]
+description = "A minimal pm2-like process guardian for local Rust binaries"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/menzil/aynur"
+keywords = ["process", "daemon", "pm2", "supervisor", "cli"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 anyhow = "1.0.86"
