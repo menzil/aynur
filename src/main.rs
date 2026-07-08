@@ -22,10 +22,18 @@ use std::time::{Duration, Instant};
 
 fn main() -> anyhow::Result<()> {
     let cli = AynurCli::parse();
+    if cli.show_version || matches!(&cli.command, Some(Command::Version)) {
+        print_version();
+        return Ok(());
+    }
+
     let paths = AynurPaths::from_env()?;
     paths.ensure()?;
 
-    match cli.command {
+    match cli
+        .command
+        .context("missing command; run `aynur help` for usage")?
+    {
         Command::Start {
             binary,
             name,
@@ -88,10 +96,15 @@ fn main() -> anyhow::Result<()> {
             let response = request_running_daemon(&paths, DaemonRequest::Delete { name })?;
             print_response(response)?;
         }
+        Command::Version => print_version(),
         Command::Daemon => run_daemon_with_error_log(paths)?,
     }
 
     Ok(())
+}
+
+fn print_version() {
+    println!("aynur {}", env!("CARGO_PKG_VERSION"));
 }
 
 fn run_daemon_with_error_log(paths: AynurPaths) -> anyhow::Result<()> {

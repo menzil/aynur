@@ -4,13 +4,16 @@ use std::path::PathBuf;
 #[derive(Debug, Parser)]
 #[command(name = "aynur")]
 #[command(
+    arg_required_else_help = true,
     about = "A minimal pm2-like process guardian for Rust binaries",
     long_about = "aynur keeps local Rust binaries running with a small daemon, pm2-like commands, local JSON state, and stdout/stderr log files.\n\nState is stored in ~/.aynur by default. Set AYNUR_HOME to use another directory.",
     after_help = "Examples:\n  aynur start ./target/release/api -- --port 3000\n  aynur start ./target/release/worker -n worker --cwd /srv/app --env-file .env\n  aynur list\n  aynur reload api --update-env\n  aynur logs api\n  aynur stop api\n  aynur delete api"
 )]
 pub struct AynurCli {
+    #[arg(short = 'v', long = "version", help = "Print version")]
+    pub show_version: bool,
     #[command(subcommand)]
-    pub command: Command,
+    pub command: Option<Command>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -101,6 +104,12 @@ pub enum Command {
         #[arg(help = "App name")]
         name: String,
     },
+    #[command(
+        about = "Print version",
+        long_about = "Print the aynur CLI version.",
+        after_help = "Example:\n  aynur version"
+    )]
+    Version,
     #[command(name = "__daemon", hide = true)]
     Daemon,
 }
