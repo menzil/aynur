@@ -70,13 +70,10 @@ aynur stop <name>
 aynur restart <name>
 aynur reload <name> [--update-env]
 aynur list
-aynur status
 aynur logs <name>
 aynur flush <name>
 aynur delete <name>
 ```
-
-`status` is an alias for `list`.
 
 ## Environment
 

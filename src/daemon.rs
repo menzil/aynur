@@ -164,10 +164,10 @@ fn ok(message: &str) -> DaemonResponse {
 
 fn start_app(state: &mut DaemonState, config: AppConfig) -> anyhow::Result<String> {
     config.validate()?;
-    if let Some(existing) = state.apps.get(&config.name) {
-        if existing.pid.is_some() {
-            anyhow::bail!("app '{}' is already running", config.name);
-        }
+    if let Some(existing) = state.apps.get(&config.name)
+        && existing.pid.is_some()
+    {
+        anyhow::bail!("app '{}' is already running", config.name);
     }
 
     let name = config.name.clone();

@@ -76,16 +76,10 @@ pub enum Command {
     },
     #[command(
         about = "List supervised apps",
-        long_about = "Show app name, pid, status, restart count, uptime, and binary path.",
+        long_about = "Show app name, pid, status, restart count, uptime, memory usage, and binary path.",
         after_help = "Example:\n  aynur list"
     )]
     List,
-    #[command(
-        about = "Alias for list",
-        long_about = "Show the same process table as `aynur list`.",
-        after_help = "Example:\n  aynur status"
-    )]
-    Status,
     #[command(
         about = "Follow stdout and stderr logs for an app",
         long_about = "Print existing app stdout and stderr logs from AYNUR_HOME/logs, then continue printing new output until interrupted with Ctrl+C.",

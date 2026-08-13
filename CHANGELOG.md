@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1] - 2026-08-13
+
+### Changed
+
+- Removed the `aynur status` command; use `aynur list` instead.
+- Added a `memory` column to `aynur list` showing resident memory for each running main process.
+
 ## [0.2.0] - 2026-08-13
 
 ### Changed

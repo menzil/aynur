@@ -4,6 +4,7 @@ use crate::daemon;
 use crate::env_file;
 use crate::ipc::{self, DaemonRequest, DaemonResponse};
 use crate::paths::AynurPaths;
+use crate::process;
 use anyhow::Context;
 use std::collections::BTreeMap;
 use std::env;
@@ -86,7 +87,7 @@ impl ExecuteCommand for Command {
                 let response = request_running_daemon(paths, request)?;
                 print_response(response)?;
             }
-            Command::List | Command::Status => {
+            Command::List => {
                 let response = request_running_daemon(paths, DaemonRequest::List)?;
                 print_response(response)?;
             }
@@ -129,7 +130,7 @@ fn absolutize_path(path: PathBuf) -> anyhow::Result<PathBuf> {
         .join(path))
 }
 
-fn default_app_name(binary_path: &PathBuf) -> anyhow::Result<String> {
+fn default_app_name(binary_path: &Path) -> anyhow::Result<String> {
     let file_name = binary_path.file_name().and_then(|name| name.to_str());
     match file_name {
         Some(name) if !name.trim().is_empty() => Ok(name.to_string()),
@@ -208,12 +209,19 @@ fn print_response(response: DaemonResponse) -> anyhow::Result<()> {
         DaemonResponse::Error { message } => anyhow::bail!("{message}"),
         DaemonResponse::List { apps } => {
             println!(
-                "{:<20} {:<8} {:<10} {:<8} {:<10} binary",
-                "name", "pid", "status", "restarts", "uptime"
+                "{:<20} {:<8} {:<10} {:<8} {:<10} {:<12} binary",
+                "name", "pid", "status", "restarts", "uptime", "memory"
             );
             for app in apps {
+                let memory = app.pid.map_or_else(
+                    || "-".to_string(),
+                    |pid| {
+                        process::read_process_rss_bytes(pid)
+                            .map_or_else(|_| "unavailable".to_string(), format_memory)
+                    },
+                );
                 println!(
-                    "{:<20} {:<8} {:<10} {:<8} {:<10} {}",
+                    "{:<20} {:<8} {:<10} {:<8} {:<10} {:<12} {}",
                     app.name,
                     app.pid
                         .map_or_else(|| "-".to_string(), |pid| pid.to_string()),
@@ -221,12 +229,36 @@ fn print_response(response: DaemonResponse) -> anyhow::Result<()> {
                     app.restarts,
                     app.uptime_seconds
                         .map_or_else(|| "-".to_string(), |uptime| format!("{uptime}s")),
+                    memory,
                     app.binary_path.display()
                 );
             }
         }
     }
     Ok(())
+}
+
+fn format_memory(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = KIB * 1024;
+    const GIB: u64 = MIB * 1024;
+
+    if bytes >= GIB {
+        format_memory_value(bytes, GIB, "GiB")
+    } else if bytes >= MIB {
+        format_memory_value(bytes, MIB, "MiB")
+    } else {
+        format_memory_value(bytes, KIB, "KiB")
+    }
+}
+
+fn format_memory_value(bytes: u64, unit: u64, suffix: &str) -> String {
+    let value = bytes as f64 / unit as f64;
+    if value >= 10.0 || value.fract() == 0.0 {
+        format!("{value:.0} {suffix}")
+    } else {
+        format!("{value:.1} {suffix}")
+    }
 }
 
 fn follow_logs(paths: &AynurPaths, name: &str) -> anyhow::Result<()> {
@@ -393,7 +425,7 @@ fn truncate_log(file: File, path: &Path, stream: &str, name: &str) -> anyhow::Re
 
 #[cfg(test)]
 mod tests {
-    use super::{LogCursor, flush_logs, write_new_log_content};
+    use super::{LogCursor, flush_logs, format_memory, write_new_log_content};
     use crate::paths::AynurPaths;
     use std::fs::{File, OpenOptions};
     use std::io::Write;
@@ -537,5 +569,14 @@ mod tests {
             std::fs::read_to_string(external_path).expect("external log content"),
             "keep\n"
         );
+    }
+
+    #[test]
+    fn formats_memory_using_binary_units() {
+        assert_eq!(format_memory(1024), "1 KiB");
+        assert_eq!(format_memory(1536), "1.5 KiB");
+        assert_eq!(format_memory(10 * 1024 + 512), "10 KiB");
+        assert_eq!(format_memory(1024 * 1024), "1 MiB");
+        assert_eq!(format_memory(1024 * 1024 * 1024), "1 GiB");
     }
 }
