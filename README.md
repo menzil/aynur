@@ -54,6 +54,14 @@ View logs:
 aynur logs api
 ```
 
+The command continues printing new stdout and stderr output until interrupted with `Ctrl+C`.
+
+Clear logs for an app:
+
+```sh
+aynur flush api
+```
+
 ## Commands
 
 ```sh
@@ -64,6 +72,7 @@ aynur reload <name> [--update-env]
 aynur list
 aynur status
 aynur logs <name>
+aynur flush <name>
 aynur delete <name>
 ```
 

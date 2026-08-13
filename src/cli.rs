@@ -7,7 +7,7 @@ use std::path::PathBuf;
     arg_required_else_help = true,
     about = "A minimal pm2-like process guardian for Rust binaries",
     long_about = "aynur keeps local Rust binaries running with a small daemon, pm2-like commands, local JSON state, and stdout/stderr log files.\n\nState is stored in ~/.aynur by default. Set AYNUR_HOME to use another directory.",
-    after_help = "Examples:\n  aynur start ./target/release/api -- --port 3000\n  aynur start ./target/release/worker -n worker --cwd /srv/app --env-file .env\n  aynur list\n  aynur reload api --update-env\n  aynur logs api\n  aynur stop api\n  aynur delete api"
+    after_help = "Examples:\n  aynur start ./target/release/api -- --port 3000\n  aynur start ./target/release/worker -n worker --cwd /srv/app --env-file .env\n  aynur list\n  aynur reload api --update-env\n  aynur logs api\n  aynur flush api\n  aynur stop api\n  aynur delete api"
 )]
 pub struct AynurCli {
     #[arg(short = 'v', long = "version", help = "Print version")]
@@ -29,7 +29,7 @@ pub enum Command {
         #[arg(
             short = 'n',
             long,
-            help = "App name used by stop/restart/reload/logs/delete; defaults to the binary file name"
+            help = "App name used by stop/restart/reload/logs/flush/delete; defaults to the binary file name"
         )]
         name: Option<String>,
         #[arg(long, help = "Working directory for the managed process")]
@@ -87,11 +87,20 @@ pub enum Command {
     )]
     Status,
     #[command(
-        about = "Print stdout and stderr logs for an app",
-        long_about = "Print the app stdout and stderr log files from AYNUR_HOME/logs.",
+        about = "Follow stdout and stderr logs for an app",
+        long_about = "Print existing app stdout and stderr logs from AYNUR_HOME/logs, then continue printing new output until interrupted with Ctrl+C.",
         after_help = "Example:\n  aynur logs api"
     )]
     Logs {
+        #[arg(help = "App name")]
+        name: String,
+    },
+    #[command(
+        about = "Clear stdout and stderr logs for an app",
+        long_about = "Truncate the app stdout and stderr log files in AYNUR_HOME/logs without interrupting the managed process.",
+        after_help = "Example:\n  aynur flush api"
+    )]
+    Flush {
         #[arg(help = "App name")]
         name: String,
     },

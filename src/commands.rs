@@ -7,11 +7,22 @@ use crate::paths::AynurPaths;
 use anyhow::Context;
 use std::collections::BTreeMap;
 use std::env;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
+
+const LOG_BOUNDARY_BYTES: u64 = 64;
+
+#[derive(Debug, Eq, PartialEq)]
+struct LogCursor {
+    position: u64,
+    boundary: Vec<u8>,
+}
 
 pub trait ExecuteCommand {
     fn execute(self, paths: &AynurPaths) -> anyhow::Result<()>;
@@ -79,7 +90,8 @@ impl ExecuteCommand for Command {
                 let response = request_running_daemon(paths, DaemonRequest::List)?;
                 print_response(response)?;
             }
-            Command::Logs { name } => print_logs(paths, &name)?,
+            Command::Logs { name } => follow_logs(paths, &name)?,
+            Command::Flush { name } => flush_logs(paths, &name)?,
             Command::Delete { name } => {
                 let response = request_running_daemon(paths, DaemonRequest::Delete { name })?;
                 print_response(response)?;
@@ -217,26 +229,313 @@ fn print_response(response: DaemonResponse) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn print_logs(paths: &AynurPaths, name: &str) -> anyhow::Result<()> {
+fn follow_logs(paths: &AynurPaths, name: &str) -> anyhow::Result<()> {
+    ensure_configured_app(paths, name)?;
     let out_path = paths.stdout_log_path(name);
     let err_path = paths.stderr_log_path(name);
-    println!("==> {} <==", out_path.display());
-    if out_path.exists() {
-        print!(
-            "{}",
-            std::fs::read_to_string(&out_path).with_context(|| {
-                format!("failed to read stdout log at {}", out_path.display())
-            })?
-        );
+    let mut out_file = open_log(&out_path, "stdout", name)?;
+    let mut err_file = open_log(&err_path, "stderr", name)?;
+    let mut out_cursor = LogCursor {
+        position: 0,
+        boundary: Vec::new(),
+    };
+    let mut err_cursor = LogCursor {
+        position: 0,
+        boundary: Vec::new(),
+    };
+    let stdout = std::io::stdout();
+    let mut output = stdout.lock();
+
+    writeln!(output, "==> {} <==", out_path.display())
+        .with_context(|| format!("failed to print stdout log header for app '{name}'"))?;
+    out_cursor = write_new_log_content(&mut out_file, &out_path, out_cursor, &mut output)?;
+    writeln!(output, "==> {} <==", err_path.display())
+        .with_context(|| format!("failed to print stderr log header for app '{name}'"))?;
+    err_cursor = write_new_log_content(&mut err_file, &err_path, err_cursor, &mut output)?;
+
+    loop {
+        out_cursor = write_new_log_content(&mut out_file, &out_path, out_cursor, &mut output)?;
+        err_cursor = write_new_log_content(&mut err_file, &err_path, err_cursor, &mut output)?;
+        thread::sleep(Duration::from_millis(100));
     }
-    println!("==> {} <==", err_path.display());
-    if err_path.exists() {
-        print!(
-            "{}",
-            std::fs::read_to_string(&err_path).with_context(|| {
-                format!("failed to read stderr log at {}", err_path.display())
-            })?
+}
+
+fn flush_logs(paths: &AynurPaths, name: &str) -> anyhow::Result<()> {
+    ensure_configured_app(paths, name)?;
+
+    let out_path = paths.stdout_log_path(name);
+    let err_path = paths.stderr_log_path(name);
+    let out_file = open_log_for_truncate(&out_path, "stdout", name)?;
+    let err_file = open_log_for_truncate(&err_path, "stderr", name)?;
+    truncate_log(out_file, &out_path, "stdout", name)?;
+    truncate_log(err_file, &err_path, "stderr", name)?;
+    println!("flushed logs for {name}");
+    Ok(())
+}
+
+fn ensure_configured_app(paths: &AynurPaths, name: &str) -> anyhow::Result<()> {
+    if name.trim().is_empty() {
+        anyhow::bail!("app name is empty");
+    }
+    if name.contains('/') {
+        anyhow::bail!("app name '{name}' must not contain '/'");
+    }
+    let config_path = paths.app_config_path(name);
+    if !config_path.is_file() {
+        anyhow::bail!(
+            "app '{name}' is not configured at {}",
+            config_path.display()
         );
     }
     Ok(())
+}
+
+fn open_log(path: &Path, stream: &str, name: &str) -> anyhow::Result<File> {
+    File::open(path).with_context(|| {
+        format!(
+            "failed to open {stream} log for app '{name}' at {}",
+            path.display()
+        )
+    })
+}
+
+fn write_new_log_content(
+    file: &mut File,
+    path: &Path,
+    cursor: LogCursor,
+    output: &mut impl Write,
+) -> anyhow::Result<LogCursor> {
+    let length = file
+        .metadata()
+        .with_context(|| format!("failed to read log metadata at {}", path.display()))?
+        .len();
+    let boundary_matches = log_boundary_matches(file, path, &cursor, length)?;
+    let read_position = if length < cursor.position || !boundary_matches {
+        0
+    } else {
+        cursor.position
+    };
+    file.seek(SeekFrom::Start(read_position))
+        .with_context(|| format!("failed to seek log at {}", path.display()))?;
+    let bytes_written = std::io::copy(file, output)
+        .with_context(|| format!("failed to print log at {}", path.display()))?;
+    output
+        .flush()
+        .with_context(|| format!("failed to flush log output for {}", path.display()))?;
+    let position = read_position + bytes_written;
+    let boundary = read_log_boundary(file, path, position)?;
+    Ok(LogCursor { position, boundary })
+}
+
+fn log_boundary_matches(
+    file: &mut File,
+    path: &Path,
+    cursor: &LogCursor,
+    length: u64,
+) -> anyhow::Result<bool> {
+    if cursor.boundary.is_empty() || length < cursor.position {
+        return Ok(true);
+    }
+    let boundary_start = cursor.position - cursor.boundary.len() as u64;
+    file.seek(SeekFrom::Start(boundary_start))
+        .with_context(|| format!("failed to seek log boundary at {}", path.display()))?;
+    let mut current_boundary = vec![0; cursor.boundary.len()];
+    file.read_exact(&mut current_boundary)
+        .with_context(|| format!("failed to read log boundary at {}", path.display()))?;
+    Ok(current_boundary == cursor.boundary)
+}
+
+fn read_log_boundary(file: &mut File, path: &Path, position: u64) -> anyhow::Result<Vec<u8>> {
+    let boundary_length = position.min(LOG_BOUNDARY_BYTES);
+    let boundary_start = position - boundary_length;
+    file.seek(SeekFrom::Start(boundary_start))
+        .with_context(|| format!("failed to seek log boundary at {}", path.display()))?;
+    let mut boundary = vec![0; boundary_length as usize];
+    file.read_exact(&mut boundary)
+        .with_context(|| format!("failed to read log boundary at {}", path.display()))?;
+    Ok(boundary)
+}
+
+fn open_log_for_truncate(path: &Path, stream: &str, name: &str) -> anyhow::Result<File> {
+    let file = OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| {
+            format!(
+                "failed to open {stream} log for app '{name}' for truncation at {}",
+                path.display()
+            )
+        })?;
+    let metadata = file.metadata().with_context(|| {
+        format!(
+            "failed to read {stream} log metadata for app '{name}' at {}",
+            path.display()
+        )
+    })?;
+    if !metadata.is_file() {
+        anyhow::bail!(
+            "{stream} log for app '{name}' is not a regular file: {}",
+            path.display()
+        );
+    }
+    Ok(file)
+}
+
+fn truncate_log(file: File, path: &Path, stream: &str, name: &str) -> anyhow::Result<()> {
+    file.set_len(0).with_context(|| {
+        format!(
+            "failed to truncate {stream} log for app '{name}' at {}",
+            path.display()
+        )
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LogCursor, flush_logs, write_new_log_content};
+    use crate::paths::AynurPaths;
+    use std::fs::{File, OpenOptions};
+    use std::io::Write;
+
+    fn test_paths(root_dir: std::path::PathBuf) -> AynurPaths {
+        AynurPaths {
+            apps_dir: root_dir.join("apps"),
+            logs_dir: root_dir.join("logs"),
+            socket_path: root_dir.join("daemon.sock"),
+            pid_path: root_dir.join("daemon.pid"),
+            root_dir,
+        }
+    }
+
+    #[test]
+    fn flushes_only_the_named_apps_logs_and_keeps_open_writers_valid() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let paths = test_paths(temp_dir.path().to_path_buf());
+        paths.ensure().expect("state directories");
+        std::fs::write(paths.app_config_path("api"), "{}").expect("app config");
+        std::fs::write(paths.stdout_log_path("api"), "old stdout\n").expect("stdout log");
+        std::fs::write(paths.stderr_log_path("api"), "old stderr\n").expect("stderr log");
+        std::fs::write(paths.stdout_log_path("worker"), "keep\n").expect("other log");
+        let mut open_writer = OpenOptions::new()
+            .append(true)
+            .open(paths.stdout_log_path("api"))
+            .expect("open stdout writer");
+
+        flush_logs(&paths, "api").expect("flush logs");
+        writeln!(open_writer, "new stdout").expect("write after flush");
+
+        assert_eq!(
+            std::fs::read_to_string(paths.stdout_log_path("api")).expect("read stdout"),
+            "new stdout\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(paths.stderr_log_path("api")).expect("read stderr"),
+            ""
+        );
+        assert_eq!(
+            std::fs::read_to_string(paths.stdout_log_path("worker")).expect("read other log"),
+            "keep\n"
+        );
+    }
+
+    #[test]
+    fn rejects_an_app_that_is_not_configured() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let paths = test_paths(temp_dir.path().to_path_buf());
+        paths.ensure().expect("state directories");
+
+        let error = flush_logs(&paths, "missing").expect_err("missing app must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("app 'missing' is not configured")
+        );
+    }
+
+    #[test]
+    fn rejects_a_configured_app_with_missing_logs() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let paths = test_paths(temp_dir.path().to_path_buf());
+        paths.ensure().expect("state directories");
+        std::fs::write(paths.app_config_path("api"), "{}").expect("app config");
+
+        let error = flush_logs(&paths, "api").expect_err("missing logs must fail");
+
+        assert!(error.to_string().contains("failed to open stdout log"));
+    }
+
+    #[test]
+    fn follows_new_content_after_a_log_is_truncated() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let log_path = temp_dir.path().join("api.out.log");
+        std::fs::write(&log_path, "old stdout\n").expect("initial log");
+        let mut log_file = File::open(&log_path).expect("open log");
+        let mut output = Vec::new();
+        let cursor = write_new_log_content(
+            &mut log_file,
+            &log_path,
+            LogCursor {
+                position: 0,
+                boundary: Vec::new(),
+            },
+            &mut output,
+        )
+        .expect("read initial log");
+        std::fs::write(&log_path, "new\n").expect("truncate log");
+
+        let new_cursor = write_new_log_content(&mut log_file, &log_path, cursor, &mut output)
+            .expect("read truncated log");
+
+        assert_eq!(output, b"old stdout\nnew\n");
+        assert_eq!(new_cursor.position, 4);
+    }
+
+    #[test]
+    fn follows_a_truncated_log_that_regrows_past_the_previous_position() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let log_path = temp_dir.path().join("api.out.log");
+        std::fs::write(&log_path, "old\n").expect("initial log");
+        let mut log_file = File::open(&log_path).expect("open log");
+        let mut output = Vec::new();
+        let cursor = write_new_log_content(
+            &mut log_file,
+            &log_path,
+            LogCursor {
+                position: 0,
+                boundary: Vec::new(),
+            },
+            &mut output,
+        )
+        .expect("read initial log");
+        std::fs::write(&log_path, "new content longer than old\n").expect("replace log");
+
+        let new_cursor = write_new_log_content(&mut log_file, &log_path, cursor, &mut output)
+            .expect("read regrown log");
+
+        assert_eq!(output, b"old\nnew content longer than old\n");
+        assert_eq!(new_cursor.position, 28);
+    }
+
+    #[test]
+    fn rejects_a_symbolic_link_log_target() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let paths = test_paths(temp_dir.path().to_path_buf());
+        paths.ensure().expect("state directories");
+        std::fs::write(paths.app_config_path("api"), "{}").expect("app config");
+        let external_path = temp_dir.path().join("external.log");
+        std::fs::write(&external_path, "keep\n").expect("external log");
+        std::os::unix::fs::symlink(&external_path, paths.stdout_log_path("api"))
+            .expect("stdout symlink");
+        std::fs::write(paths.stderr_log_path("api"), "stderr\n").expect("stderr log");
+
+        let error = flush_logs(&paths, "api").expect_err("symlink must fail");
+
+        assert!(error.to_string().contains("failed to open stdout log"));
+        assert_eq!(
+            std::fs::read_to_string(external_path).expect("external log content"),
+            "keep\n"
+        );
+    }
 }
