@@ -5,6 +5,9 @@ use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use std::time::Duration;
+
+const IPC_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
@@ -27,6 +30,7 @@ pub enum DaemonRequest {
         env: BTreeMap<String, String>,
     },
     List,
+    Save,
     Delete {
         name: String,
     },
@@ -53,6 +57,8 @@ pub struct AppStatusView {
 
 pub fn send_request(paths: &AynurPaths, request: &DaemonRequest) -> anyhow::Result<DaemonResponse> {
     let mut stream = UnixStream::connect(&paths.socket_path)?;
+    stream.set_read_timeout(Some(IPC_TIMEOUT))?;
+    stream.set_write_timeout(Some(IPC_TIMEOUT))?;
     let request_line = serde_json::to_string(request)?;
     stream.write_all(request_line.as_bytes())?;
     stream.write_all(b"\n")?;

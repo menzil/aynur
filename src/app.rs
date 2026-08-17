@@ -78,6 +78,29 @@ impl AppConfig {
             .with_context(|| format!("failed to write app config at {}", path.display()))
     }
 
+    pub fn load(paths: &AynurPaths, name: &str) -> anyhow::Result<Self> {
+        if name.trim().is_empty() {
+            anyhow::bail!("app name is empty");
+        }
+        if name.contains('/') {
+            anyhow::bail!("app name '{name}' must not contain '/'");
+        }
+        let path = paths.app_config_path(name);
+        let content = std::fs::read_to_string(&path)
+            .with_context(|| format!("failed to read app config at {}", path.display()))?;
+        let config = serde_json::from_str::<Self>(&content)
+            .with_context(|| format!("failed to parse app config at {}", path.display()))?;
+        if config.name != name {
+            anyhow::bail!(
+                "app config at {} has name '{}', expected '{}'",
+                path.display(),
+                config.name,
+                name
+            );
+        }
+        Ok(config)
+    }
+
     pub fn delete(paths: &AynurPaths, name: &str) -> anyhow::Result<()> {
         let path = paths.app_config_path(name);
         if path.exists() {

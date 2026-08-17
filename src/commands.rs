@@ -2,9 +2,10 @@ use crate::app::{AppConfig, RestartPolicy};
 use crate::cli::Command;
 use crate::daemon;
 use crate::env_file;
-use crate::ipc::{self, DaemonRequest, DaemonResponse};
+use crate::ipc::{self, AppStatusView, DaemonRequest, DaemonResponse};
 use crate::paths::AynurPaths;
 use crate::process;
+use crate::startup;
 use anyhow::Context;
 use std::collections::BTreeMap;
 use std::env;
@@ -88,7 +89,11 @@ impl ExecuteCommand for Command {
                 print_response(response)?;
             }
             Command::List => {
-                let response = request_running_daemon(paths, DaemonRequest::List)?;
+                let response = request_app_list(paths)?;
+                print_response(response)?;
+            }
+            Command::Save => {
+                let response = request_running_daemon(paths, DaemonRequest::Save)?;
                 print_response(response)?;
             }
             Command::Logs { name } => follow_logs(paths, &name)?,
@@ -96,6 +101,14 @@ impl ExecuteCommand for Command {
             Command::Delete { name } => {
                 let response = request_running_daemon(paths, DaemonRequest::Delete { name })?;
                 print_response(response)?;
+            }
+            Command::Startup => {
+                let message = startup::install(paths)?;
+                println!("{message}");
+            }
+            Command::Unstartup => {
+                let message = startup::uninstall(paths)?;
+                println!("{message}");
             }
             Command::Version => print_version(),
             Command::Daemon => run_daemon_with_error_log(paths.clone())?,
@@ -112,7 +125,7 @@ pub fn print_version() {
 fn run_daemon_with_error_log(paths: AynurPaths) -> anyhow::Result<()> {
     if let Err(error) = daemon::run(paths.clone()) {
         let message = format!("{error:#}\n");
-        let log_path = paths.root_dir.join("daemon.err.log");
+        let log_path = paths.daemon_error_log_path();
         std::fs::write(&log_path, message).with_context(|| {
             format!("failed to write daemon error log at {}", log_path.display())
         })?;
@@ -195,12 +208,88 @@ fn request_running_daemon(
     paths: &AynurPaths,
     request: DaemonRequest,
 ) -> anyhow::Result<DaemonResponse> {
-    ipc::send_request(paths, &request).with_context(|| {
+    ipc::send_request(paths, &request).or_else(|error| daemon_contact_error(paths, error))
+}
+
+fn request_app_list(paths: &AynurPaths) -> anyhow::Result<DaemonResponse> {
+    match ipc::send_request(paths, &DaemonRequest::List) {
+        Ok(response) => Ok(response),
+        Err(error) => {
+            if is_inactive_daemon_socket_error(&error) {
+                return Ok(DaemonResponse::List {
+                    apps: configured_app_statuses(paths)?,
+                });
+            }
+            daemon_contact_error(paths, error)
+        }
+    }
+}
+
+fn daemon_contact_error<T>(paths: &AynurPaths, error: anyhow::Error) -> anyhow::Result<T> {
+    Err(error).with_context(|| {
         format!(
             "failed to contact aynur daemon at {}; run `aynur start <binary> --name <name>` first",
             paths.socket_path.display()
         )
     })
+}
+
+fn is_inactive_daemon_socket_error(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|io_error| {
+            matches!(
+                io_error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            )
+        })
+}
+
+fn configured_app_statuses(paths: &AynurPaths) -> anyhow::Result<Vec<AppStatusView>> {
+    let entries = std::fs::read_dir(&paths.apps_dir).with_context(|| {
+        format!(
+            "failed to read configured apps directory at {}",
+            paths.apps_dir.display()
+        )
+    })?;
+    let mut apps = Vec::new();
+    for entry_result in entries {
+        let entry = entry_result.with_context(|| {
+            format!(
+                "failed to read configured app entry in {}",
+                paths.apps_dir.display()
+            )
+        })?;
+        let file_type = entry.file_type().with_context(|| {
+            format!(
+                "failed to read configured app file type at {}",
+                entry.path().display()
+            )
+        })?;
+        if !file_type.is_file() || !is_app_config_file(&entry.path()) {
+            continue;
+        }
+
+        let path = entry.path();
+        let content = std::fs::read_to_string(&path)
+            .with_context(|| format!("failed to read app config at {}", path.display()))?;
+        let config = serde_json::from_str::<AppConfig>(&content)
+            .with_context(|| format!("failed to parse app config at {}", path.display()))?;
+        apps.push(AppStatusView {
+            name: config.name,
+            pid: None,
+            status: "stopped".to_string(),
+            restarts: 0,
+            uptime_seconds: None,
+            binary_path: config.binary_path,
+        });
+    }
+    apps.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(apps)
+}
+
+fn is_app_config_file(path: &Path) -> bool {
+    path.extension().and_then(|extension| extension.to_str()) == Some("json")
 }
 
 fn print_response(response: DaemonResponse) -> anyhow::Result<()> {
@@ -425,10 +514,14 @@ fn truncate_log(file: File, path: &Path, stream: &str, name: &str) -> anyhow::Re
 
 #[cfg(test)]
 mod tests {
-    use super::{LogCursor, flush_logs, format_memory, write_new_log_content};
+    use super::{LogCursor, flush_logs, format_memory, request_app_list, write_new_log_content};
+    use crate::app::{AppConfig, RestartPolicy};
+    use crate::ipc::{AppStatusView, DaemonResponse};
     use crate::paths::AynurPaths;
+    use std::collections::BTreeMap;
     use std::fs::{File, OpenOptions};
     use std::io::Write;
+    use std::os::unix::net::UnixListener;
 
     fn test_paths(root_dir: std::path::PathBuf) -> AynurPaths {
         AynurPaths {
@@ -438,6 +531,32 @@ mod tests {
             pid_path: root_dir.join("daemon.pid"),
             root_dir,
         }
+    }
+
+    fn write_app_config(paths: &AynurPaths, name: &str) {
+        let config = AppConfig {
+            name: name.to_string(),
+            binary_path: paths.root_dir.join(format!("{name}-bin")),
+            args: Vec::new(),
+            working_directory: paths.root_dir.clone(),
+            env: BTreeMap::new(),
+            env_file_path: None,
+            restart_policy: RestartPolicy {
+                max_restarts: 5,
+                window_seconds: 10,
+            },
+        };
+        let content = serde_json::to_string(&config).expect("serialize app config");
+        std::fs::write(paths.app_config_path(name), content).expect("app config");
+    }
+
+    fn assert_stopped_app(app: AppStatusView, name: &str, binary_path: std::path::PathBuf) {
+        assert_eq!(app.name, name);
+        assert_eq!(app.pid, None);
+        assert_eq!(app.status, "stopped");
+        assert_eq!(app.restarts, 0);
+        assert_eq!(app.uptime_seconds, None);
+        assert_eq!(app.binary_path, binary_path);
     }
 
     #[test]
@@ -496,6 +615,74 @@ mod tests {
         let error = flush_logs(&paths, "api").expect_err("missing logs must fail");
 
         assert!(error.to_string().contains("failed to open stdout log"));
+    }
+
+    #[test]
+    fn lists_no_apps_when_daemon_socket_is_missing_and_no_apps_are_configured() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let paths = test_paths(temp_dir.path().to_path_buf());
+        paths.ensure().expect("state directories");
+
+        let response = request_app_list(&paths).expect("list without configured apps");
+
+        match response {
+            DaemonResponse::List { apps } => assert!(apps.is_empty()),
+            response => panic!("expected list response, got {response:?}"),
+        }
+    }
+
+    #[test]
+    fn lists_no_apps_when_daemon_socket_is_stale_and_no_apps_are_configured() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let paths = test_paths(temp_dir.path().to_path_buf());
+        paths.ensure().expect("state directories");
+        let listener = UnixListener::bind(&paths.socket_path).expect("stale daemon socket");
+        drop(listener);
+
+        let response = request_app_list(&paths).expect("list with stale socket");
+
+        match response {
+            DaemonResponse::List { apps } => assert!(apps.is_empty()),
+            response => panic!("expected list response, got {response:?}"),
+        }
+    }
+
+    #[test]
+    fn lists_configured_apps_as_stopped_when_daemon_socket_is_missing() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let paths = test_paths(temp_dir.path().to_path_buf());
+        paths.ensure().expect("state directories");
+        write_app_config(&paths, "api");
+
+        let response = request_app_list(&paths).expect("list configured app without daemon");
+
+        match response {
+            DaemonResponse::List { apps } => {
+                let [app] = apps.try_into().expect("one configured app");
+                assert_stopped_app(app, "api", paths.root_dir.join("api-bin"));
+            }
+            response => panic!("expected list response, got {response:?}"),
+        }
+    }
+
+    #[test]
+    fn lists_configured_apps_as_stopped_when_daemon_socket_is_stale() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let paths = test_paths(temp_dir.path().to_path_buf());
+        paths.ensure().expect("state directories");
+        write_app_config(&paths, "api");
+        let listener = UnixListener::bind(&paths.socket_path).expect("stale daemon socket");
+        drop(listener);
+
+        let response = request_app_list(&paths).expect("list configured app with stale socket");
+
+        match response {
+            DaemonResponse::List { apps } => {
+                let [app] = apps.try_into().expect("one configured app");
+                assert_stopped_app(app, "api", paths.root_dir.join("api-bin"));
+            }
+            response => panic!("expected list response, got {response:?}"),
+        }
     }
 
     #[test]

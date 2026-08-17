@@ -7,7 +7,7 @@ use std::path::PathBuf;
     arg_required_else_help = true,
     about = "A minimal pm2-like process guardian for Rust binaries",
     long_about = "aynur keeps local Rust binaries running with a small daemon, pm2-like commands, local JSON state, and stdout/stderr log files.\n\nState is stored in ~/.aynur by default. Set AYNUR_HOME to use another directory.",
-    after_help = "Examples:\n  aynur start ./target/release/api -- --port 3000\n  aynur start ./target/release/worker -n worker --cwd /srv/app --env-file .env\n  aynur list\n  aynur reload api --update-env\n  aynur logs api\n  aynur flush api\n  aynur stop api\n  aynur delete api"
+    after_help = "Examples:\n  aynur start ./target/release/api -- --port 3000\n  aynur start ./target/release/worker -n worker --cwd /srv/app --env-file .env\n  aynur list\n  aynur save\n  aynur startup\n  aynur reload api --update-env\n  aynur logs api\n  aynur flush api\n  aynur stop api\n  aynur delete api"
 )]
 pub struct AynurCli {
     #[arg(short = 'v', long = "version", help = "Print version")]
@@ -81,6 +81,12 @@ pub enum Command {
     )]
     List,
     #[command(
+        about = "Save the current online app list",
+        long_about = "Save a restart snapshot containing only apps that are currently online. The daemon restores this snapshot when it starts later.",
+        after_help = "Example:\n  aynur save"
+    )]
+    Save,
+    #[command(
         about = "Follow stdout and stderr logs for an app",
         long_about = "Print existing app stdout and stderr logs from AYNUR_HOME/logs, then continue printing new output until interrupted with Ctrl+C.",
         after_help = "Example:\n  aynur logs api"
@@ -107,6 +113,18 @@ pub enum Command {
         #[arg(help = "App name")]
         name: String,
     },
+    #[command(
+        about = "Install user-level daemon startup",
+        long_about = "Install and enable user-level startup for the aynur daemon. Linux uses a systemd user service. macOS uses a launchd LaunchAgent.",
+        after_help = "Example:\n  aynur startup"
+    )]
+    Startup,
+    #[command(
+        about = "Remove user-level daemon startup",
+        long_about = "Disable and remove the user-level startup service for the aynur daemon.",
+        after_help = "Example:\n  aynur unstartup"
+    )]
+    Unstartup,
     #[command(
         about = "Print version",
         long_about = "Print the aynur CLI version.",

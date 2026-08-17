@@ -38,6 +38,16 @@ List apps:
 aynur list
 ```
 
+Save the current online app snapshot:
+
+```sh
+aynur save
+```
+
+Only apps that are `online` when `aynur save` runs are restored the next time the daemon starts. `start`, `stop`, and `delete` do not update this snapshot automatically; run `aynur save` again after changing the desired restart set.
+
+Saving the snapshot does not install system startup. Run `aynur startup` once to restore the daemon automatically after the next user login.
+
 Stop, restart, reload, and delete:
 
 ```sh
@@ -62,6 +72,18 @@ Clear logs for an app:
 aynur flush api
 ```
 
+Install user-level startup for the daemon:
+
+```sh
+aynur startup
+```
+
+Remove user-level startup:
+
+```sh
+aynur unstartup
+```
+
 ## Commands
 
 ```sh
@@ -70,9 +92,12 @@ aynur stop <name>
 aynur restart <name>
 aynur reload <name> [--update-env]
 aynur list
+aynur save
 aynur logs <name>
 aynur flush <name>
 aynur delete <name>
+aynur startup
+aynur unstartup
 ```
 
 ## Environment
@@ -82,6 +107,7 @@ State is stored in `~/.aynur` by default:
 ```text
 ~/.aynur/apps/
 ~/.aynur/logs/
+~/.aynur/saved.json
 ~/.aynur/daemon.pid
 ~/.aynur/daemon.sock
 ```
@@ -110,6 +136,16 @@ Refresh the saved environment from the current shell and the configured env file
 aynur reload api --update-env
 ```
 
+## Startup
+
+`aynur startup` installs the daemon as a user-level startup service using the current `aynur` executable path and current `AYNUR_HOME`.
+
+On Linux, aynur writes `~/.config/systemd/user/aynur.service`, runs `systemctl --user daemon-reload`, and enables the service with `systemctl --user enable`. The service starts at the next user session; the command prints a `loginctl enable-linger <user>` hint for boot-before-login behavior, but does not run it with sudo.
+
+On macOS, aynur writes `~/Library/LaunchAgents/cn.aynur.daemon.plist` and enables the LaunchAgent. It starts at the next user login, without interrupting a daemon that is already running.
+
+If `aynur startup` is run from a debug build such as `target/debug/aynur`, the startup service uses that resolved executable path. Install the release binary first when that is the path you want restored after reboot.
+
 ## Behavior
 
 - Linux/macOS only.
@@ -118,7 +154,8 @@ aynur reload api --update-env
 - Unexpected exits are restarted automatically.
 - Fast crash loops are marked as `errored` instead of restarting forever.
 - stdout and stderr are appended to separate log files.
+- The daemon restores apps listed in `~/.aynur/saved.json` when it starts.
 
 ## Scope
 
-`aynur` intentionally keeps the first version small. It does not implement pm2 ecosystem files, cluster mode, startup integration, remote management, dashboards, or Windows support.
+`aynur` intentionally keeps the first version small. It does not implement pm2 ecosystem files, cluster mode, remote management, dashboards, or Windows support.

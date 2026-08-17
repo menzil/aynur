@@ -6,6 +6,8 @@ mod env_file;
 mod ipc;
 mod paths;
 mod process;
+mod saved;
+mod startup;
 
 use anyhow::Context;
 use clap::Parser;
