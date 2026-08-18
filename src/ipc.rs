@@ -8,6 +8,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 const IPC_TIMEOUT: Duration = Duration::from_secs(5);
+// Increment this whenever the daemon request or response wire contract changes.
+pub const DAEMON_PROTOCOL_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
@@ -39,9 +41,19 @@ pub enum DaemonRequest {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum DaemonResponse {
-    Ok { message: String },
-    Error { message: String },
-    List { apps: Vec<AppStatusView> },
+    Pong {
+        protocol_version: u32,
+        daemon_version: String,
+    },
+    Ok {
+        message: String,
+    },
+    Error {
+        message: String,
+    },
+    List {
+        apps: Vec<AppStatusView>,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

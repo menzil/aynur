@@ -77,6 +77,18 @@ impl SavedApps {
 
 fn write_atomically(path: &Path, content: &str) -> anyhow::Result<()> {
     let temporary_path = path.with_file_name(".saved.json.tmp");
+    match std::fs::remove_file(&temporary_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to remove stale temporary saved app list at {}",
+                    temporary_path.display()
+                )
+            });
+        }
+    }
     let mut file = OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -178,7 +190,7 @@ mod tests {
     }
 
     #[test]
-    fn preserves_the_previous_snapshot_when_a_temporary_file_exists() {
+    fn replaces_a_stale_temporary_file_without_losing_the_previous_snapshot() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let paths = test_paths(temp_dir.path().to_path_buf());
         paths.ensure().expect("state directories");
@@ -196,13 +208,14 @@ mod tests {
             saved_at_unix_seconds: 8,
             app_names: vec!["web".to_string()],
         };
-        let error = replacement.save(&paths).expect_err("temporary collision");
-
-        assert!(error.to_string().contains("temporary saved app list"));
+        replacement
+            .save(&paths)
+            .expect("replace stale temporary file");
         assert_eq!(
             SavedApps::load_optional(&paths).expect("load previous"),
-            Some(previous)
+            Some(replacement)
         );
+        assert!(!paths.root_dir.join(".saved.json.tmp").exists());
     }
 
     #[test]

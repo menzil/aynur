@@ -6,6 +6,9 @@ use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::Sender;
 use std::thread;
+use std::time::Duration;
+
+const STARTUP_CONFIRMATION_WINDOW: Duration = Duration::from_millis(500);
 
 pub fn read_process_rss_bytes(pid: u32) -> anyhow::Result<u64> {
     platform::read_process_rss_bytes(pid)
@@ -108,10 +111,27 @@ pub fn spawn_app(
         });
     }
 
-    let child = command
-        .spawn()
-        .with_context(|| format!("failed to spawn app '{}'", config.name))?;
+    let mut child = command.spawn().with_context(|| {
+        format!(
+            "failed to spawn app '{}' from {}",
+            config.name,
+            config.binary_path.display()
+        )
+    })?;
     let pid = child.id();
+    thread::sleep(STARTUP_CONFIRMATION_WINDOW);
+    if let Some(status) = child
+        .try_wait()
+        .with_context(|| format!("failed to confirm startup for app '{}'", config.name))?
+    {
+        anyhow::bail!(
+            "app '{}' exited during startup with {}; binary: {}; stderr log: {}",
+            config.name,
+            status,
+            config.binary_path.display(),
+            paths.stderr_log_path(&config.name).display()
+        );
+    }
     watch_child(config.name.clone(), pid, child, event_sender);
     Ok(pid)
 }

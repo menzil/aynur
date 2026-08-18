@@ -38,13 +38,13 @@ List apps:
 aynur list
 ```
 
-Save the current online app snapshot:
+Refresh the current online app snapshot:
 
 ```sh
 aynur save
 ```
 
-Only apps that are `online` when `aynur save` runs are restored the next time the daemon starts. `start`, `stop`, and `delete` do not update this snapshot automatically; run `aynur save` again after changing the desired restart set.
+The restart snapshot tracks apps that are `online` when it is refreshed. Successful `start`, `stop`, `restart`, `reload`, and `delete` commands refresh it automatically, so the daemon restores the latest desired app set after a restart. Managed apps that fail during restore remain for a later retry until they are explicitly stopped or deleted. A missing app config remains until it is deleted or the snapshot is manually resynced with `aynur save`. Run `aynur save` to explicitly resync the snapshot with the current online app set.
 
 Saving the snapshot does not install system startup. Run `aynur startup` once to restore the daemon automatically after the next user login.
 
@@ -155,6 +155,7 @@ If `aynur startup` is run from a debug build such as `target/debug/aynur`, the s
 - Fast crash loops are marked as `errored` instead of restarting forever.
 - stdout and stderr are appended to separate log files.
 - The daemon restores apps listed in `~/.aynur/saved.json` when it starts.
+- Successful lifecycle changes keep `~/.aynur/saved.json` synchronized with the current online app set.
 
 ## Scope
 

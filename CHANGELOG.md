@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.3.1] - 2026-08-18
+
+### Changed
+
+- Successful app lifecycle commands now keep the restart snapshot synchronized with the desired app set.
+- Failed or missing restore entries remain available for a later retry until explicitly removed.
+- CLI and daemon IPC now reject incompatible legacy protocol peers with an actionable restart message.
+
+### Fixed
+
+- Automatic snapshot writes recover stale temporary files and rebuild corrupt snapshots from daemon state.
+- App startup failures now report the exit status, binary path, and stderr log path.
+- Failed automatic restarts are marked as errored without stopping the daemon.
+
 ## [0.3.0] - 2026-08-17
 
 ### Added

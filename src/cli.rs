@@ -81,8 +81,8 @@ pub enum Command {
     )]
     List,
     #[command(
-        about = "Save the current online app list",
-        long_about = "Save a restart snapshot containing only apps that are currently online. The daemon restores this snapshot when it starts later.",
+        about = "Refresh the restart snapshot",
+        long_about = "Refresh the restart snapshot with apps that are currently online. Successful start, stop, restart, reload, and delete commands refresh this snapshot automatically; managed apps that fail to restore remain for a later retry until stopped or deleted, while missing app configs require delete or a manual save to remove.",
         after_help = "Example:\n  aynur save"
     )]
     Save,

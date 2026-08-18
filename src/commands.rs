@@ -2,7 +2,7 @@ use crate::app::{AppConfig, RestartPolicy};
 use crate::cli::Command;
 use crate::daemon;
 use crate::env_file;
-use crate::ipc::{self, AppStatusView, DaemonRequest, DaemonResponse};
+use crate::ipc::{self, AppStatusView, DAEMON_PROTOCOL_VERSION, DaemonRequest, DaemonResponse};
 use crate::paths::AynurPaths;
 use crate::process;
 use crate::startup;
@@ -164,8 +164,10 @@ fn merged_environment(env_file_path: Option<&PathBuf>) -> anyhow::Result<BTreeMa
 }
 
 fn ensure_daemon(paths: &AynurPaths) -> anyhow::Result<()> {
-    if ipc::send_request(paths, &DaemonRequest::Ping).is_ok() {
-        return Ok(());
+    match ipc::send_request(paths, &DaemonRequest::Ping) {
+        Ok(response) => return validate_daemon_ping(response),
+        Err(error) if is_inactive_daemon_socket_error(&error) => {}
+        Err(error) => return daemon_contact_error(paths, error),
     }
 
     let current_exe = env::current_exe().context("failed to resolve current executable path")?;
@@ -192,8 +194,10 @@ fn wait_for_daemon(paths: &AynurPaths) -> anyhow::Result<()> {
     let started_at = Instant::now();
     let timeout = Duration::from_secs(3);
     while started_at.elapsed() < timeout {
-        if ipc::send_request(paths, &DaemonRequest::Ping).is_ok() {
-            return Ok(());
+        match ipc::send_request(paths, &DaemonRequest::Ping) {
+            Ok(response) => return validate_daemon_ping(response),
+            Err(error) if is_inactive_daemon_socket_error(&error) => {}
+            Err(error) => return daemon_contact_error(paths, error),
         }
         thread::sleep(Duration::from_millis(50));
     }
@@ -208,12 +212,17 @@ fn request_running_daemon(
     paths: &AynurPaths,
     request: DaemonRequest,
 ) -> anyhow::Result<DaemonResponse> {
+    require_compatible_daemon(paths)?;
     ipc::send_request(paths, &request).or_else(|error| daemon_contact_error(paths, error))
 }
 
 fn request_app_list(paths: &AynurPaths) -> anyhow::Result<DaemonResponse> {
-    match ipc::send_request(paths, &DaemonRequest::List) {
-        Ok(response) => Ok(response),
+    match ipc::send_request(paths, &DaemonRequest::Ping) {
+        Ok(response) => {
+            validate_daemon_ping(response)?;
+            ipc::send_request(paths, &DaemonRequest::List)
+                .or_else(|error| daemon_contact_error(paths, error))
+        }
         Err(error) => {
             if is_inactive_daemon_socket_error(&error) {
                 return Ok(DaemonResponse::List {
@@ -222,6 +231,47 @@ fn request_app_list(paths: &AynurPaths) -> anyhow::Result<DaemonResponse> {
             }
             daemon_contact_error(paths, error)
         }
+    }
+}
+
+fn require_compatible_daemon(paths: &AynurPaths) -> anyhow::Result<()> {
+    let response = ipc::send_request(paths, &DaemonRequest::Ping)
+        .or_else(|error| daemon_contact_error(paths, error))?;
+    validate_daemon_ping(response)
+}
+
+fn validate_daemon_ping(response: DaemonResponse) -> anyhow::Result<()> {
+    match response {
+        DaemonResponse::Pong {
+            protocol_version,
+            daemon_version,
+        } if protocol_version == DAEMON_PROTOCOL_VERSION && !daemon_version.trim().is_empty() => {
+            Ok(())
+        }
+        DaemonResponse::Pong {
+            protocol_version,
+            daemon_version,
+        } if protocol_version == DAEMON_PROTOCOL_VERSION => anyhow::bail!(
+            "aynur daemon returned an invalid ping response: daemonVersion is empty for protocol {}; received daemonVersion '{}'",
+            protocol_version,
+            daemon_version
+        ),
+        DaemonResponse::Pong {
+            protocol_version,
+            daemon_version,
+        } => anyhow::bail!(
+            "aynur daemon protocol is incompatible: CLI {} requires protocol {}, but daemon {} uses protocol {}; restart the daemon after upgrading aynur",
+            env!("CARGO_PKG_VERSION"),
+            DAEMON_PROTOCOL_VERSION,
+            daemon_version,
+            protocol_version
+        ),
+        DaemonResponse::Ok { message } if message == "pong" => anyhow::bail!(
+            "aynur daemon protocol is incompatible: CLI {} requires protocol {}, but the running daemon uses the legacy protocol; restart the daemon after upgrading aynur",
+            env!("CARGO_PKG_VERSION"),
+            DAEMON_PROTOCOL_VERSION
+        ),
+        response => anyhow::bail!("aynur daemon returned an invalid ping response: {response:?}"),
     }
 }
 
@@ -294,6 +344,14 @@ fn is_app_config_file(path: &Path) -> bool {
 
 fn print_response(response: DaemonResponse) -> anyhow::Result<()> {
     match response {
+        DaemonResponse::Pong {
+            protocol_version,
+            daemon_version,
+        } => anyhow::bail!(
+            "received an unexpected ping response from daemon {} using protocol {}",
+            daemon_version,
+            protocol_version
+        ),
         DaemonResponse::Ok { message } => println!("{message}"),
         DaemonResponse::Error { message } => anyhow::bail!("{message}"),
         DaemonResponse::List { apps } => {
@@ -514,14 +572,18 @@ fn truncate_log(file: File, path: &Path, stream: &str, name: &str) -> anyhow::Re
 
 #[cfg(test)]
 mod tests {
-    use super::{LogCursor, flush_logs, format_memory, request_app_list, write_new_log_content};
+    use super::{
+        LogCursor, flush_logs, format_memory, request_app_list, request_running_daemon,
+        validate_daemon_ping, write_new_log_content,
+    };
     use crate::app::{AppConfig, RestartPolicy};
-    use crate::ipc::{AppStatusView, DaemonResponse};
+    use crate::ipc::{AppStatusView, DAEMON_PROTOCOL_VERSION, DaemonRequest, DaemonResponse};
     use crate::paths::AynurPaths;
     use std::collections::BTreeMap;
     use std::fs::{File, OpenOptions};
-    use std::io::Write;
+    use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixListener;
+    use std::thread;
 
     fn test_paths(root_dir: std::path::PathBuf) -> AynurPaths {
         AynurPaths {
@@ -557,6 +619,57 @@ mod tests {
         assert_eq!(app.restarts, 0);
         assert_eq!(app.uptime_seconds, None);
         assert_eq!(app.binary_path, binary_path);
+    }
+
+    #[test]
+    fn accepts_matching_daemon_protocol() {
+        validate_daemon_ping(DaemonResponse::Pong {
+            protocol_version: DAEMON_PROTOCOL_VERSION,
+            daemon_version: env!("CARGO_PKG_VERSION").to_string(),
+        })
+        .expect("matching daemon protocol");
+    }
+
+    #[test]
+    fn rejects_legacy_daemon_before_sending_business_requests() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let paths = test_paths(temp_dir.path().to_path_buf());
+        paths.ensure().expect("state directories");
+        let listener = UnixListener::bind(&paths.socket_path).expect("legacy daemon socket");
+        let server = thread::spawn(move || {
+            let (mut stream, _address) = listener.accept().expect("accept ping");
+            let mut request_line = String::new();
+            BufReader::new(&stream)
+                .read_line(&mut request_line)
+                .expect("read ping request");
+            let request =
+                serde_json::from_str::<DaemonRequest>(&request_line).expect("parse ping request");
+            assert!(matches!(request, DaemonRequest::Ping));
+            let response = serde_json::to_string(&DaemonResponse::Ok {
+                message: "pong".to_string(),
+            })
+            .expect("serialize legacy ping response");
+            writeln!(stream, "{response}").expect("write legacy ping response");
+        });
+
+        let error = request_running_daemon(&paths, DaemonRequest::Save)
+            .expect_err("legacy daemon must be rejected");
+        server.join().expect("legacy daemon thread");
+
+        assert!(error.to_string().contains("legacy protocol"));
+        assert!(error.to_string().contains("restart the daemon"));
+    }
+
+    #[test]
+    fn rejects_mismatched_daemon_protocol() {
+        let error = validate_daemon_ping(DaemonResponse::Pong {
+            protocol_version: DAEMON_PROTOCOL_VERSION + 1,
+            daemon_version: "future".to_string(),
+        })
+        .expect_err("mismatched daemon protocol must be rejected");
+
+        assert!(error.to_string().contains("daemon future"));
+        assert!(error.to_string().contains("protocol 2"));
     }
 
     #[test]

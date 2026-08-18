@@ -1,11 +1,11 @@
 use crate::app::AppConfig;
 use crate::env_file;
-use crate::ipc::{AppStatusView, DaemonRequest, DaemonResponse};
+use crate::ipc::{AppStatusView, DAEMON_PROTOCOL_VERSION, DaemonRequest, DaemonResponse};
 use crate::paths::AynurPaths;
 use crate::process::{self, ExitEvent};
 use crate::saved::{SavedApps, unix_timestamp};
 use anyhow::Context;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::os::fd::AsRawFd;
@@ -168,9 +168,7 @@ fn handle_connection(mut stream: UnixStream, state: &mut DaemonState) -> anyhow:
             .read_line(&mut request_line)
             .context("failed to read daemon request")?;
     }
-    let request = serde_json::from_str::<DaemonRequest>(&request_line)
-        .context("failed to parse daemon request JSON")?;
-    let response = handle_request(request, state);
+    let response = response_from_request_line(&request_line, state);
     let response_line =
         serde_json::to_string(&response).context("failed to serialize daemon response")?;
     stream
@@ -182,21 +180,49 @@ fn handle_connection(mut stream: UnixStream, state: &mut DaemonState) -> anyhow:
     Ok(())
 }
 
+fn response_from_request_line(request_line: &str, state: &mut DaemonState) -> DaemonResponse {
+    match serde_json::from_str::<DaemonRequest>(request_line) {
+        Ok(request) => handle_request(request, state),
+        Err(error) => DaemonResponse::Error {
+            message: format!("unsupported or malformed daemon request: {error}"),
+        },
+    }
+}
+
 fn handle_request(request: DaemonRequest, state: &mut DaemonState) -> DaemonResponse {
     match request {
-        DaemonRequest::Ping => ok("pong"),
-        DaemonRequest::Start { config } => response_from_result(start_app(state, config)),
-        DaemonRequest::Stop { name } => response_from_result(stop_app(state, &name)),
-        DaemonRequest::Restart { name } => response_from_result(restart_app(state, &name)),
-        DaemonRequest::Reload { name } => response_from_result(reload_app(state, &name)),
+        DaemonRequest::Ping => DaemonResponse::Pong {
+            protocol_version: DAEMON_PROTOCOL_VERSION,
+            daemon_version: env!("CARGO_PKG_VERSION").to_string(),
+        },
+        DaemonRequest::Start { config } => {
+            let result = start_app(state, config);
+            response_from_mutation_result(state, result, None)
+        }
+        DaemonRequest::Stop { name } => {
+            let result = stop_app(state, &name);
+            response_from_mutation_result(state, result, Some(&name))
+        }
+        DaemonRequest::Restart { name } => {
+            let result = restart_app(state, &name);
+            response_from_mutation_result(state, result, None)
+        }
+        DaemonRequest::Reload { name } => {
+            let result = reload_app(state, &name);
+            response_from_mutation_result(state, result, None)
+        }
         DaemonRequest::ReloadUpdateEnv { name, env } => {
-            response_from_result(reload_update_env(state, &name, env))
+            let result = reload_update_env(state, &name, env);
+            response_from_mutation_result(state, result, None)
         }
         DaemonRequest::List => DaemonResponse::List {
             apps: list_apps(state),
         },
         DaemonRequest::Save => response_from_result(save_online_apps(state)),
-        DaemonRequest::Delete { name } => response_from_result(delete_app(state, &name)),
+        DaemonRequest::Delete { name } => {
+            let result = delete_app(state, &name);
+            response_from_mutation_result(state, result, Some(&name))
+        }
     }
 }
 
@@ -207,6 +233,19 @@ fn response_from_result(result: anyhow::Result<String>) -> DaemonResponse {
             message: format!("{error:#}"),
         },
     }
+}
+
+fn response_from_mutation_result(
+    state: &DaemonState,
+    result: anyhow::Result<String>,
+    excluded_name: Option<&str>,
+) -> DaemonResponse {
+    let result = result.and_then(|message| {
+        synchronize_restart_snapshot(state, excluded_name)
+            .context("failed to synchronize restart snapshot after successful operation")?;
+        Ok(message)
+    });
+    response_from_result(result)
 }
 
 fn ok(message: &str) -> DaemonResponse {
@@ -225,7 +264,11 @@ fn start_app(state: &mut DaemonState, config: AppConfig) -> anyhow::Result<Strin
 
     let name = config.name.clone();
     let mut runtime = new_runtime_app(config, AppStatus::Starting);
-    spawn_runtime_app(state, &mut runtime)?;
+    if let Err(error) = spawn_runtime_app(state, &mut runtime) {
+        runtime.status = AppStatus::Errored;
+        state.apps.insert(name, runtime);
+        return Err(error);
+    }
     let pid = runtime.pid.context("spawned app did not record pid")?;
     state.apps.insert(name.clone(), runtime);
     Ok(format!("started {name} with pid {pid}"))
@@ -265,7 +308,11 @@ fn restart_app(state: &mut DaemonState, name: &str) -> anyhow::Result<String> {
         .remove(name)
         .with_context(|| format!("app '{name}' is not managed"))?;
     app.status = AppStatus::Starting;
-    spawn_runtime_app(state, &mut app)?;
+    if let Err(error) = spawn_runtime_app(state, &mut app) {
+        app.status = AppStatus::Errored;
+        state.apps.insert(name.to_string(), app);
+        return Err(error);
+    }
     let pid = app.pid.context("restarted app did not record pid")?;
     state.apps.insert(name.to_string(), app);
     Ok(format!("restarted {name} with pid {pid}"))
@@ -329,6 +376,50 @@ fn save_online_apps(state: &DaemonState) -> anyhow::Result<String> {
     saved_apps.save(&state.paths)?;
     Ok(format!(
         "saved {} online app(s) to {}",
+        saved_apps.app_names.len(),
+        state.paths.saved_apps_path().display()
+    ))
+}
+
+fn synchronize_restart_snapshot(
+    state: &DaemonState,
+    excluded_name: Option<&str>,
+) -> anyhow::Result<String> {
+    let previous_names = match SavedApps::load_optional(&state.paths) {
+        Ok(saved_apps) => saved_apps
+            .map(|saved_apps| saved_apps.app_names)
+            .unwrap_or_default(),
+        Err(error) => {
+            append_daemon_error(
+                &state.paths,
+                &format!(
+                    "failed to read the existing restart snapshot during automatic sync; rebuilding it from daemon state: {error:#}"
+                ),
+            )?;
+            Vec::new()
+        }
+    };
+    let mut app_names = state
+        .apps
+        .values()
+        .filter(|app| matches!(app.status, AppStatus::Online | AppStatus::Errored))
+        .map(|app| app.config.name.clone())
+        .collect::<BTreeSet<_>>();
+
+    for name in previous_names {
+        if excluded_name == Some(name.as_str()) || state.apps.contains_key(&name) {
+            continue;
+        }
+        app_names.insert(name);
+    }
+
+    let saved_apps = SavedApps::from_app_names(
+        app_names.into_iter().collect(),
+        unix_timestamp(SystemTime::now())?,
+    );
+    saved_apps.save(&state.paths)?;
+    Ok(format!(
+        "saved {} restart app(s) to {}",
         saved_apps.app_names.len(),
         state.paths.saved_apps_path().display()
     ))
@@ -455,8 +546,15 @@ fn handle_exit_event(state: &mut DaemonState, event: ExitEvent) -> anyhow::Resul
     let name = app.config.name.clone();
     app.restarts += 1;
     app.status = AppStatus::Starting;
-    spawn_runtime_app(state, &mut app)
-        .with_context(|| format!("failed to restart app '{name}' after child exit"))?;
+    if let Err(error) = spawn_runtime_app(state, &mut app) {
+        app.status = AppStatus::Errored;
+        append_daemon_error(
+            &state.paths,
+            &format!("failed to restart app '{name}' after child exit: {error:#}"),
+        )?;
+        state.apps.insert(name, app);
+        return Ok(());
+    }
     state.apps.insert(name, app);
     Ok(())
 }
@@ -495,13 +593,16 @@ fn list_apps(state: &DaemonState) -> Vec<AppStatusView> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppStatus, DaemonState, RuntimeApp, acquire_pid_lock, restore_saved_apps, save_online_apps,
-        set_connection_blocking, stop_app,
+        AppStatus, DaemonState, RuntimeApp, acquire_pid_lock, handle_connection, handle_exit_event,
+        handle_request, restore_saved_apps, save_online_apps, set_connection_blocking, stop_app,
     };
     use crate::app::{AppConfig, RestartPolicy};
+    use crate::ipc::{DaemonRequest, DaemonResponse};
     use crate::paths::AynurPaths;
+    use crate::process::ExitEvent;
     use crate::saved::SavedApps;
     use std::collections::{BTreeMap, HashMap};
+    use std::io::{BufRead, BufReader, Write};
     use std::os::fd::AsRawFd;
     use std::os::unix::net::UnixStream;
     use std::path::PathBuf;
@@ -593,6 +694,21 @@ mod tests {
         }
     }
 
+    fn immediate_exit_config(paths: &AynurPaths, name: &str) -> AppConfig {
+        AppConfig {
+            name: name.to_string(),
+            binary_path: PathBuf::from("/usr/bin/false"),
+            args: Vec::new(),
+            working_directory: paths.root_dir.clone(),
+            env: BTreeMap::new(),
+            env_file_path: None,
+            restart_policy: RestartPolicy {
+                max_restarts: 5,
+                window_seconds: 10,
+            },
+        }
+    }
+
     fn save_snapshot(paths: &AynurPaths, app_names: Vec<String>) {
         SavedApps {
             version: 1,
@@ -646,6 +762,283 @@ mod tests {
     }
 
     #[test]
+    fn ping_reports_daemon_protocol_and_version() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let paths = test_paths(temp_dir.path().to_path_buf());
+        let mut state = test_state(paths);
+
+        let response = handle_request(DaemonRequest::Ping, &mut state);
+
+        assert!(matches!(
+            response,
+            DaemonResponse::Pong {
+                protocol_version: crate::ipc::DAEMON_PROTOCOL_VERSION,
+                daemon_version,
+            } if daemon_version == env!("CARGO_PKG_VERSION")
+        ));
+    }
+
+    #[test]
+    fn malformed_request_returns_a_structured_error_response() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let paths = test_paths(temp_dir.path().to_path_buf());
+        paths.ensure().expect("state directories");
+        let mut state = test_state(paths);
+        let (mut client, server) = UnixStream::pair().expect("unix stream pair");
+        client
+            .write_all(b"{\"type\":\"futureCommand\"}\n")
+            .expect("write unsupported request");
+
+        handle_connection(server, &mut state).expect("handle unsupported request");
+
+        let mut response_line = String::new();
+        BufReader::new(client)
+            .read_line(&mut response_line)
+            .expect("read daemon response");
+        let response =
+            serde_json::from_str::<DaemonResponse>(&response_line).expect("parse daemon response");
+        match response {
+            DaemonResponse::Error { message } => {
+                assert!(message.contains("unsupported or malformed daemon request"));
+                assert!(message.contains("futureCommand"));
+            }
+            response => panic!("expected error response, got {response:?}"),
+        }
+    }
+
+    #[test]
+    fn reports_an_app_that_exits_during_startup() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let paths = test_paths(temp_dir.path().to_path_buf());
+        paths.ensure().expect("state directories");
+        let config = immediate_exit_config(&paths, "api");
+        config.save(&paths).expect("app config");
+        let mut state = test_state(paths);
+
+        let response = handle_request(DaemonRequest::Start { config }, &mut state);
+
+        match response {
+            DaemonResponse::Error { message } => {
+                assert!(message.contains("app 'api' exited during startup"));
+                assert!(message.contains("/usr/bin/false"));
+                assert!(message.contains("api.err.log"));
+            }
+            response => panic!("expected startup error, got {response:?}"),
+        }
+        let app = state.apps.get("api").expect("errored app state");
+        assert_eq!(app.pid, None);
+        assert!(matches!(app.status, AppStatus::Errored));
+    }
+
+    #[test]
+    fn marks_an_immediate_automatic_restart_failure_as_errored() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let paths = test_paths(temp_dir.path().to_path_buf());
+        paths.ensure().expect("state directories");
+        let mut state = test_state(paths);
+        let mut app = runtime_app(
+            immediate_exit_config(&state.paths, "api"),
+            AppStatus::Online,
+        );
+        app.pid = Some(42);
+        state.apps.insert("api".to_string(), app);
+
+        handle_exit_event(
+            &mut state,
+            ExitEvent {
+                name: "api".to_string(),
+                pid: 42,
+            },
+        )
+        .expect("automatic restart failure must not stop daemon");
+
+        let app = state.apps.get("api").expect("errored app state");
+        assert_eq!(app.pid, None);
+        assert!(matches!(app.status, AppStatus::Errored));
+        let log_content =
+            std::fs::read_to_string(state.paths.daemon_error_log_path()).expect("daemon error log");
+        assert!(log_content.contains("failed to restart app 'api' after child exit"));
+        assert!(log_content.contains("exited during startup"));
+    }
+
+    #[test]
+    fn lifecycle_mutations_refresh_the_restart_snapshot() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let paths = test_paths(temp_dir.path().to_path_buf());
+        paths.ensure().expect("state directories");
+        let config = sleep_config(&paths, "api");
+        config.save(&paths).expect("app config");
+        let mut state = test_state(paths);
+
+        let response = handle_request(
+            DaemonRequest::Start {
+                config: config.clone(),
+            },
+            &mut state,
+        );
+        assert!(matches!(response, DaemonResponse::Ok { .. }));
+        let saved_apps = SavedApps::load_optional(&state.paths)
+            .expect("load saved apps after start")
+            .expect("saved apps after start");
+        assert_eq!(saved_apps.app_names, vec!["api"]);
+
+        let response = handle_request(
+            DaemonRequest::Restart {
+                name: "api".to_string(),
+            },
+            &mut state,
+        );
+        assert!(matches!(response, DaemonResponse::Ok { .. }));
+        let saved_apps = SavedApps::load_optional(&state.paths)
+            .expect("load saved apps after restart")
+            .expect("saved apps after restart");
+        assert_eq!(saved_apps.app_names, vec!["api"]);
+
+        let response = handle_request(
+            DaemonRequest::Reload {
+                name: "api".to_string(),
+            },
+            &mut state,
+        );
+        assert!(matches!(response, DaemonResponse::Ok { .. }));
+        let saved_apps = SavedApps::load_optional(&state.paths)
+            .expect("load saved apps after reload")
+            .expect("saved apps after reload");
+        assert_eq!(saved_apps.app_names, vec!["api"]);
+
+        let response = handle_request(
+            DaemonRequest::Stop {
+                name: "api".to_string(),
+            },
+            &mut state,
+        );
+        assert!(matches!(response, DaemonResponse::Ok { .. }));
+        let saved_apps = SavedApps::load_optional(&state.paths)
+            .expect("load saved apps after stop")
+            .expect("saved apps after stop");
+        assert!(saved_apps.app_names.is_empty());
+    }
+
+    #[test]
+    fn delete_refreshes_the_restart_snapshot() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let paths = test_paths(temp_dir.path().to_path_buf());
+        paths.ensure().expect("state directories");
+        let config = sleep_config(&paths, "api");
+        config.save(&paths).expect("app config");
+        let mut state = test_state(paths);
+
+        let response = handle_request(DaemonRequest::Start { config }, &mut state);
+        assert!(matches!(response, DaemonResponse::Ok { .. }));
+
+        let response = handle_request(
+            DaemonRequest::Delete {
+                name: "api".to_string(),
+            },
+            &mut state,
+        );
+        assert!(matches!(response, DaemonResponse::Ok { .. }));
+        let saved_apps = SavedApps::load_optional(&state.paths)
+            .expect("load saved apps after delete")
+            .expect("saved apps after delete");
+        assert!(saved_apps.app_names.is_empty());
+        assert!(!state.paths.app_config_path("api").exists());
+    }
+
+    #[test]
+    fn failed_lifecycle_mutation_preserves_the_restart_snapshot() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let paths = test_paths(temp_dir.path().to_path_buf());
+        paths.ensure().expect("state directories");
+        save_snapshot(&paths, vec!["api".to_string()]);
+        let mut state = test_state(paths);
+
+        let response = handle_request(
+            DaemonRequest::Stop {
+                name: "api".to_string(),
+            },
+            &mut state,
+        );
+        assert!(matches!(response, DaemonResponse::Error { .. }));
+        let saved_apps = SavedApps::load_optional(&state.paths)
+            .expect("load saved apps after failed stop")
+            .expect("saved apps after failed stop");
+        assert_eq!(saved_apps.app_names, vec!["api"]);
+    }
+
+    #[test]
+    fn automatic_sync_preserves_failed_restore_entries_until_removed() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let paths = test_paths(temp_dir.path().to_path_buf());
+        paths.ensure().expect("state directories");
+        save_snapshot(&paths, vec!["bad".to_string(), "good".to_string()]);
+        let mut state = test_state(paths);
+        state.apps.insert(
+            "bad".to_string(),
+            runtime_app(
+                missing_binary_config(&state.paths, "bad"),
+                AppStatus::Errored,
+            ),
+        );
+        state.apps.insert(
+            "good".to_string(),
+            runtime_app(sleep_config(&state.paths, "good"), AppStatus::Online),
+        );
+
+        let response = handle_request(
+            DaemonRequest::Stop {
+                name: "good".to_string(),
+            },
+            &mut state,
+        );
+        assert!(matches!(response, DaemonResponse::Ok { .. }));
+        let saved_apps = SavedApps::load_optional(&state.paths)
+            .expect("load saved apps after stopping good")
+            .expect("saved apps after stopping good");
+        assert_eq!(saved_apps.app_names, vec!["bad"]);
+
+        let response = handle_request(
+            DaemonRequest::Delete {
+                name: "bad".to_string(),
+            },
+            &mut state,
+        );
+        assert!(matches!(response, DaemonResponse::Ok { .. }));
+        let saved_apps = SavedApps::load_optional(&state.paths)
+            .expect("load saved apps after deleting bad")
+            .expect("saved apps after deleting bad");
+        assert!(saved_apps.app_names.is_empty());
+    }
+
+    #[test]
+    fn automatic_sync_rebuilds_a_corrupt_restart_snapshot() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let paths = test_paths(temp_dir.path().to_path_buf());
+        paths.ensure().expect("state directories");
+        std::fs::write(paths.saved_apps_path(), "not json").expect("corrupt snapshot");
+        let mut state = test_state(paths);
+        state.apps.insert(
+            "api".to_string(),
+            runtime_app(sleep_config(&state.paths, "api"), AppStatus::Online),
+        );
+
+        let response = handle_request(
+            DaemonRequest::Delete {
+                name: "missing".to_string(),
+            },
+            &mut state,
+        );
+        assert!(matches!(response, DaemonResponse::Ok { .. }));
+        let saved_apps = SavedApps::load_optional(&state.paths)
+            .expect("load rebuilt saved apps")
+            .expect("rebuilt saved apps");
+        assert_eq!(saved_apps.app_names, vec!["api"]);
+        let log_content =
+            std::fs::read_to_string(state.paths.daemon_error_log_path()).expect("daemon log");
+        assert!(log_content.contains("rebuilding it from daemon state"));
+    }
+
+    #[test]
     fn marks_failed_restore_as_errored_and_continues_restoring_other_apps() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let paths = test_paths(temp_dir.path().to_path_buf());
@@ -670,6 +1063,10 @@ mod tests {
         let log_content =
             std::fs::read_to_string(state.paths.daemon_error_log_path()).expect("error log");
         assert!(log_content.contains("failed to restore app 'bad'"));
+        let saved_apps = SavedApps::load_optional(&state.paths)
+            .expect("load saved apps after restore")
+            .expect("saved apps after restore");
+        assert_eq!(saved_apps.app_names, vec!["bad", "good"]);
         stop_app(&mut state, "good").expect("stop restored app");
     }
 
@@ -687,5 +1084,9 @@ mod tests {
         let log_content =
             std::fs::read_to_string(state.paths.daemon_error_log_path()).expect("error log");
         assert!(log_content.contains("saved app config is missing"));
+        let saved_apps = SavedApps::load_optional(&state.paths)
+            .expect("load saved apps after missing restore")
+            .expect("saved apps after missing restore");
+        assert_eq!(saved_apps.app_names, vec!["missing"]);
     }
 }
